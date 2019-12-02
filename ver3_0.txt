@@ -1,0 +1,539 @@
+#include <Wire.h>
+#include <GOFi2cOLED.h>
+#include "TimerOne.h"
+
+////
+//HANG SO PHAN CUNG VA PHAN MEM
+////
+#define N_MAX 20000      //tan so timer 1
+#define DELAY_TIME  1500 //thoi gian delay nut nhan
+#define DELAY_TIME2  7000 //thoi gian delay cong tac hanh trinh
+
+
+//cac thong so co the thay doi duoc
+#define PULSE_PER_REV 400 //so xung de quay duoc 1 vong
+#define LEN_PER_REV   8   //do dai x khi quay duoc 1 vong (mm)
+#define SAFE_SPEED1 1     //toc do khi chay khi con cach dau hoac cuoi 1 khoang SAFE_DISTANCE1 (hien tai = 20mm)
+#define SAFE_SPEED2 2     //toc do khi chay khi con cach dau hoac cuoi 1 khoang SAFE_DISTANCE2 (hien tai = 50mm)
+#define NORMAL_SPEED 10   //toc do chay thong thuong (vong/s)
+#define SAFE_DISTANCE1 20  //khoang cach giam toc (don vi: mm)
+#define SAFE_DISTANCE2 50  //khoang cach giam toc (don vi: mm)
+#define LENGTH  790      //chieu dai vitme (mm)
+
+#define SPEED10 10        //toc do 10 vong/s
+#define SPEED20 20        //toc do 20 vong/s
+#define SPEED30 30        //toc do 30 vong/s
+
+//su dung cac button, cong tac hanh trinh, cac tin hieu dieu khien dong co
+#define buttonON  LOW
+#define buttonOFF HIGH
+#define pulseON LOW
+#define pulseOFF HIGH
+#define LtoR HIGH
+#define RtoL LOW
+#define ledON HIGH
+#define ledOFF LOW
+#define _MANUAL 0
+#define _AUTO   1
+#define _HOME   2
+#define _IDLE   3
+#define _ERROR  4
+
+//su dung cac Pin
+#define ledPin    13
+#define button    5  //pin 5: doc tin hieu ngat button 1 (MANUAL)
+#define button2   6  //pin 6: doc tin hieu ngat button 2 (AUTO)
+#define button3   7  //pin 7: doc tin hieu ngat button 3 (HOME)
+#define tranSwitch    2  //pin 4: cong tac hanh trinh dau
+#define tranSwitch2   3  //pin 3: cong tac hanh trinh cuoi
+#define pulse 10   //pin 10: chan PULSE+ tren driver
+#define dir 9      //pin 9: chan DIR+ tren driver
+#define ena 8      //pin 8: chan ENA+ tren driver
+
+//su dung cac ngat
+#define interrupt1   1    // ngat 1 (pin 3)
+#define interrupt    0    // ngat 0 (pin 2)
+
+
+//cac bien su trong ham
+int accx, Nx, noise, noise2;
+bool pulse_x, pulseState, dirState;
+bool buttonState, ledState, ledState2, ledState3;
+byte systemState;
+unsigned currentT, previousT, previousT2;
+long signed pulseCnt, desirablePulse, MAXpulse;
+double desirablePos, currentPos, lengthOfVitme;
+
+GOFi2cOLED GOFoled;
+
+void setup() {
+  // put your setup code here, to run once:
+  Serial.begin(9600);
+  pinMode(button, INPUT_PULLUP);
+  pinMode(button2, INPUT_PULLUP);
+  pinMode(button3, INPUT_PULLUP);
+  pinMode(ledPin, OUTPUT);
+  pinMode(pulse, OUTPUT);
+  pinMode(dir, OUTPUT);
+  pinMode(ena, OUTPUT);
+  pinMode(tranSwitch, INPUT_PULLUP);
+  pinMode(tranSwitch2, INPUT_PULLUP);   //sd dien tro keo len cho pin 3, ngat 1
+
+  //khai bao cac trang thai ban dau (trang thai Reset):
+  ledState = ledOFF;  ////
+  ledState2 = ledOFF; //trang thai cac led
+  ledState3 = ledOFF; ////
+  dirState = LtoR;    //chieu quay tu trai sang phai
+  pulseState = pulseOFF; // mac dinh ban dau dong co khong quay
+  noise = 0;    //bien chong rung nut nhan
+  noise2 = 0;    //bien chong rung nut nhan hanh trinh dau
+  pulseCnt = 0;      //bien dem xung
+  currentPos = 0;      //vi tri
+  Nx = 0;       //so xung xuat ra trong 1s
+  systemState = _IDLE;  //trang thai cua he thong
+  desirablePos = 0;
+  desirablePulse = 0;
+  lengthOfVitme = LENGTH; //chieu dai cua vitme (li thuyet)
+  MAXpulse = pos2pulse(lengthOfVitme);  //vi tri Max theo chieu dai ly thuyet
+  currentT = 0;
+  previousT = 0;
+  previousT2 = 0;
+
+  //default address is 0x3C.
+  GOFoled.init(0x3C);
+  // init done
+  GOFoled.display(); // show splashscreen
+
+  digitalWrite(ledPin, ledState);      ////
+  digitalWrite(dir, dirState);
+  digitalWrite(ena, pulseState);    ////
+  Timer1.initialize(25);    //khoi tao timer 1 co chu ki 25 microseconds
+  Timer1.attachInterrupt(pulseOut); //xuat xung theo timer
+
+  attachInterrupt(interrupt1, tranSwitchCall2, FALLING);     //ngat 1 cho cong tac hanh trinh cuoi   (pin 3)
+  attachInterrupt(interrupt, tranSwitchCall, FALLING);     //ngat 0 cho cong tac hanh trinh dau    (pin 2)
+
+}
+
+////CHUONG TRINH CON////
+////
+//Cac ham chuyen doi
+////
+//van toc sang xung
+int spd2pulse(double spd) {
+  return int(spd * PULSE_PER_REV);
+}
+//vi tri sang xung
+long unsigned pos2pulse(double pos) {
+  return unsigned(pos / LEN_PER_REV * PULSE_PER_REV);
+}
+//xung sang vi tri
+double pulse2pos(long unsigned pul) {
+  return (double)pul / PULSE_PER_REV * LEN_PER_REV;
+}
+
+////
+//Cac ham ngat
+////
+//khi button MANUAL duoc nhan
+void checkButtonMANUAL() {
+  if (digitalRead(button) == buttonON) {
+    noise ++;
+    if (noise == 1) {
+      //Nx = spd2pulse(SPEED30); //gan toc do chay MANUAL
+      ledState = !ledState; //bao hieu so lan nhan
+      goHome();  //chay lui ve Home
+      //neu so lan nhan la chan thi xuat xung
+      if (ledState) {
+        pulseState = pulseON;
+        setTimer();
+        Serial.print("ON\t");
+        Serial.println(pulseCnt);
+      }
+      else {
+        desirablePulse = pulseCnt;
+        desirablePos = pulse2pos(desirablePulse); //cap nhat vi tri truoc khi OFF;
+        pulseState = pulseOFF;
+        setTimer();
+        Serial.print("OFF\t");
+        Serial.println(pulseCnt);
+      }
+    }
+  }
+}
+
+//khi button AUTO duoc nhan
+void checkButtonAUTO() {
+  if (digitalRead(button2) == buttonON) {
+    noise ++;
+    if (noise == 1) {
+      //Nx = spd2pulse(SPEED30); //gan toc do chay AUTO
+      ledState2 = !ledState2; //bao hieu so lan nhan
+      goHome(); //chay lui ve HOME
+      //neu so lan nhan la chan thi cho xuat xung
+      if (ledState2) {
+        pulseState = pulseON;
+        setTimer();
+        Serial.print("ON_2\t");
+        Serial.println(pulseCnt);
+      }
+      else {
+        pulseState = pulseOFF;
+        setTimer();
+        Serial.print("OFF_2\t");
+        Serial.println(pulseCnt);
+      }
+    }
+
+  }
+}
+//khi nhan button HOME
+void checkButtonHOME() {
+  if (digitalRead(button3) == buttonON) {
+    noise ++;
+    if (noise == 1) {
+      Nx = spd2pulse(SPEED10); //cai dat toc do chay ve HOME
+      ledState3 = ledON;  //mac dinh chay ve HOME ngay
+      goHome(); //chay lui ve HOME
+      Serial.print("Go HOME from\t");
+      Serial.println(pulseCnt);
+    }
+  }
+}
+
+//khi cong tac hanh trinh cuoi duoc nhan
+void tranSwitchCall2() {
+  noise2++;
+  if (noise2 == 1) {
+    goHome();
+    MAXpulse = pulseCnt;  ////
+    lengthOfVitme = pulse2pos(MAXpulse); //ghi nho so xung cuc dai luc nay
+    Serial.print("MAXIMUM\t");
+    Serial.println(pulseCnt);
+  }
+}
+//khi cong tac hanh trinh dau duoc nhan
+void tranSwitchCall() {
+  noise2++; //lay canh xuong dau tien
+  if (noise2 == 1) {
+    pulseCnt = 0;
+    //kiem tra trang thai he thong
+    switch (systemState) {
+      case _MANUAL:   //Neu he thong dang MANUAL ma gap cong tac hanh trinh thi chay tien
+        goForward();
+        break;
+      case _AUTO:     //Neu he thong dang AUTO ma gap cong tac hanh trinh thi chay tien
+        goForward();
+        break;
+      case _HOME:     //Neu he thong dang ve HOME va gap cong tac hanh trinh HOME thi dung lai
+        stopAll();
+        break;
+      case _IDLE:
+        nothingChange();  //He thong dang roi thi khong hoat dong nen chi de phong ho ^^
+        break;
+      case _ERROR:
+        stopAll();    //Khi he thong co loi trong bat ki tinh huong nao cung dung xuat xung (dua ve trang thai reset)
+        break;
+      default:
+        nothingChange();  //Mac dinh loi thi co the khong lam gi hoac dua ve stop All
+        break;
+    }
+    Serial.print("get HOME\t");
+    Serial.println(pulseCnt);
+  }
+}
+
+//tao xung khi tran timer
+void pulseOut()
+{ //tao xung clock theo chu ki timer
+  pulse_x = !pulse_x;
+  //kiem tra canh len
+  if (pulse_x == 1) {
+    //thuc hien noi suy
+    accx = accx + Nx;
+    if (accx >= N_MAX) {
+      accx = accx - N_MAX;
+      digitalWrite(pulse, HIGH);
+      updatePulse();                  //khi co 1 xung duoc xuat ra thi cap nhat lai vi tri cua vitme
+    }
+    else
+      digitalWrite(pulse, LOW);
+  }
+  else
+    digitalWrite(pulse, LOW);
+}
+
+////
+//cac ham dieu khien
+////
+//khong thay doi
+void nothingChange() {
+}
+//dung tat ca
+void stopAll() {
+  ledState = ledOFF;
+  ledState2 = ledOFF;
+  ledState3 = ledOFF;
+  pulseState = pulseOFF;
+  setTimer();
+}
+//di tien
+void goForward() {
+  dirState = LtoR;
+  pulseState = pulseON;
+  setTimer();
+}
+//di lui
+void goHome () {
+  dirState = RtoL;
+  pulseState = pulseON;
+  setTimer();
+}
+
+////
+//cac ham cap nhat trang thai
+////
+//cap nhat xung trong trang thai MANUAL
+void ManualState() {
+  //kiem tra xem dang di tien hay lui de tang bien dem
+  if (isForward()) {
+    pulseCnt++;
+  }
+  else if (isBackward()) {
+    pulseCnt--;
+    if (pulseCnt < 0) pulseCnt = 0;
+  }
+}
+//cap nhat xung trong trang thai AUTO
+void AutoState() {
+  if (isForward()) {
+    pulseCnt++;
+    if (pulseCnt == desirablePulse ) {
+      stopAll();  //dung khi dat duoc vi tri POS
+    }
+  }
+  else if (isBackward()) {
+    pulseCnt--;
+    if (pulseCnt < 0) pulseCnt = 0;
+  }
+}
+//cap nhat xung trong trang thai HOME
+void HomeState() {
+  if (isForward()) {
+    pulseCnt++;
+    if (pulseCnt == desirablePulse ) {
+      stopAll();  //dung khi dat duoc vi tri POS
+    }
+  }
+  else if (isBackward()) {
+    pulseCnt--;
+  }
+}
+//cap nhat trang thai cua he thong tu trang thai nut nhan
+void GetSystemState()
+{
+  //kiem tra trang thai MANUAL
+  if (ledState && !ledState2 && !ledState3)
+    systemState = _MANUAL;
+  //kiem tra trang thai AUTO
+  else if (!ledState && ledState2 && !ledState3)
+    systemState = _AUTO;
+  //kiem tra trang thai HOME
+  else if (!ledState && !ledState2 && ledState3)
+    systemState = _HOME;
+  //kiem tra trang thai IDLE
+  else if (!ledState && !ledState2 && !ledState3)
+    systemState = _IDLE;
+  //ngoai cac trang thai tren thi tat ca trang thai con lai la loi
+  else
+    systemState = _ERROR;
+}
+//cap nhat so xung
+void updatePulse()
+{
+  GetSystemState(); //lay trang thai
+  //cap nhat xung theo cac trang thai
+  switch (systemState) {
+    case _MANUAL:
+      ManualState();
+      break;
+    case _AUTO:
+      AutoState();
+      break;
+    case _HOME:
+      HomeState();
+      break;
+    case _IDLE:
+      nothingChange();
+      break;
+    case _ERROR:
+      stopAll();
+      break;
+    default:
+      nothingChange();
+      break;
+  }
+}
+//cap nhat toc do
+void updateSpeed() {
+  if (isBackward()) {
+    if (currentPos < SAFE_DISTANCE1)
+      Nx = spd2pulse(SAFE_SPEED1);
+    else if (currentPos >= SAFE_DISTANCE1 && currentPos < SAFE_DISTANCE2)
+      Nx = spd2pulse(SAFE_SPEED2);
+    else
+      Nx = spd2pulse(NORMAL_SPEED);
+  }
+  else if (isForward()) {
+    if (currentPos >= (lengthOfVitme - SAFE_DISTANCE1))
+      Nx = spd2pulse(SAFE_SPEED1);
+    else if (currentPos >= (lengthOfVitme - SAFE_DISTANCE2) && currentPos < (lengthOfVitme - SAFE_DISTANCE1))
+      Nx = spd2pulse(SAFE_SPEED2);
+    else
+      Nx = spd2pulse(NORMAL_SPEED);
+  }
+}
+
+////
+//cac ham kiem tra
+////
+//kiem tra di tien
+bool isForward() {
+  return dirState == LtoR && pulseState == pulseON;
+}
+//kiem tra di lui
+bool isBackward() {
+  return dirState ==  RtoL && pulseState == pulseON;
+}
+
+////
+//Cac ham hien thi
+////
+//hien thi ki tu
+void displayOLED( String(kitu)) {
+  GOFoled.print(kitu);
+  GOFoled.println();
+}
+//xoa man hinh
+void clearScreen() {
+  GOFoled.clearDisplay();
+  GOFoled.setCursor(0, 0);
+}
+//chinh co chu va mau sac
+void setTEXT() {
+  GOFoled.setTextSize(1);
+  GOFoled.setTextColor(WHITE);
+}
+//hien thi ra man hinh
+void displayLedState() {
+  clearScreen();
+  setTEXT();
+
+  if (ledState == ledON) displayOLED("BUTTON: ON");
+  else displayOLED("BUTTON: OFF");
+
+  if (ledState2 == ledON) displayOLED("BUTTON2: ON");
+  else displayOLED("BUTTON2: OFF");
+
+  if (ledState3 == ledON) displayOLED("BUTTON3: ON");
+  else displayOLED("BUTTON3: OFF");
+
+  switch (systemState) {
+    case _MANUAL:
+      displayOLED("SYSTEM: MANUAL");
+      break;
+    case _AUTO:
+      displayOLED("SYSTEM: AUTO");;
+      break;
+    case _HOME:
+      displayOLED("SYSTEM: HOME");;
+      break;
+    case _IDLE:
+      displayOLED("SYSTEM: IDLE");;
+      break;
+    case _ERROR:
+      displayOLED("SYSTEM: ERROR");;
+      break;
+    default:
+      nothingChange();
+      break;
+  }
+  String myString = String(pulse2pos(pulseCnt));
+  displayOLED("X: "+ String(pulse2pos(pulseCnt)));
+  displayOLED("Max length: " + String(lengthOfVitme));
+  displayOLED("_B*V*N_");
+
+  GOFoled.display();
+}
+
+////
+//For debug fuction
+////
+//khu nhieu
+void checkTime() {
+  currentT = millis();
+  if (currentT - previousT >= DELAY_TIME) {
+    noise = 0;
+    previousT = currentT;
+  }
+  if (currentT - previousT2 >= DELAY_TIME2) {
+    noise2 = 0;
+    previousT2 = currentT;
+  }
+}
+void Display() {
+  Serial.print(systemState);
+  Serial.print("\t");
+  Serial.print(pulseCnt);
+  Serial.print("\t");
+  Serial.print(currentPos);
+  Serial.print("\t");
+  Serial.println(desirablePulse);
+}
+//nhap nhay LED
+void blinkingLED() {
+  currentT = millis();
+  if (currentT - previousT >= DELAY_TIME) {
+    ledState = !ledState;
+    digitalWrite(ledPin, ledState);
+    previousT = currentT;
+  }
+}
+
+////
+//turn on, off timer
+////
+void setTimer() {
+  if (pulseState == pulseOFF) {
+    Timer1.stop();
+  }
+  else {
+    Timer1.start();
+  }
+}
+
+////
+//Chuong trinh chinh
+////
+void loop() {
+  //Kiem tra cac nut nhan
+  checkButtonMANUAL();
+  checkButtonAUTO();
+  checkButtonHOME();
+  //cap nhat trang thai he thong:
+  GetSystemState();
+  //chuyen doi so xung sang vi tri
+  currentPos = pulse2pos(pulseCnt);
+  //set toc do
+  updateSpeed();
+  //hien thi ra man hinh
+  displayLedState();
+  //loc nhieu
+  checkTime();
+  //Debug
+  Display();
+
+  digitalWrite(dir, dirState);
+  digitalWrite(ena, pulseState);
+  digitalWrite(ledPin, ledState);
+}
